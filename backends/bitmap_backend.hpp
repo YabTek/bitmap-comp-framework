@@ -10,6 +10,8 @@
 // result is returned as a QueryResult, which still holds the compressed form;
 // converting it back to raw words (to_words(), used only for verification)
 // happens after the timer has been stopped.
+#include "common/binary.hpp"
+#include "common/statistics.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -18,7 +20,7 @@
 namespace bench {
 
 class QueryResult {
-public:
+  public:
     virtual ~QueryResult() = default;
 
     // Number of set bits. Cheap for most representations; never timed.
@@ -27,32 +29,38 @@ public:
     // Decode back to the raw uint64_t form, for comparison against the
     // reference backend under --verify=1. Never timed.
     virtual std::vector<uint64_t> to_words() const = 0;
+    virtual size_t payload_bytes() const = 0;
+    virtual RepresentationStats statistics() const { return {}; }
 };
 
 using QueryResultPtr = std::unique_ptr<QueryResult>;
 
 class BitmapBackend {
-public:
+  public:
     virtual ~BitmapBackend() = default;
 
     // Convert the dataset into this backend's representation. `bitmaps[i]` has
     // words_for_bits(num_bits) words.
-    virtual void build(const std::vector<std::vector<uint64_t>>& bitmaps,
-                       uint64_t num_bits) = 0;
+    virtual void build(const std::vector<std::vector<uint64_t>> &bitmaps, uint64_t num_bits) = 0;
 
     // Intersection / union of the listed bitmaps, computed natively.
     // `ids` holds at least one index; indices are valid by construction.
-    virtual QueryResultPtr query_and(const std::vector<size_t>& ids) const = 0;
-    virtual QueryResultPtr query_or(const std::vector<size_t>& ids) const = 0;
+    virtual QueryResultPtr query_and(const std::vector<size_t> &ids) const = 0;
+    virtual QueryResultPtr query_or(const std::vector<size_t> &ids) const = 0;
 
-    // Total size of the whole dataset in this representation, in bytes, as it
-    // would be serialized -- i.e. the payload only, without allocator slack,
-    // std::vector capacity overshoot or object headers. This is the numerator
-    // of the compression ratio, so every backend has to compute it the same
-    // honest way; see the per-backend comments for what exactly is counted.
+    // Exact saved dataset size: native payloads plus the shared archive header
+    // and per-bitmap lengths. Excludes allocator slack and resident objects.
+    // serialize().size() must equal this value. The compression ratio is
+    // raw.serialized_bytes() / backend.serialized_bytes().
     virtual size_t serialized_bytes() const = 0;
+    virtual size_t payload_bytes() const = 0;
+    virtual RepresentationStats statistics() const { return {}; }
 
-    virtual const char* name() const = 0;
+    // Exact archive bytes, including logical length and per-bitmap framing.
+    virtual Bytes serialize() const = 0;
+    virtual void deserialize(const Bytes &bytes) = 0;
+
+    virtual const char *name() const = 0;
 };
 
 } // namespace bench

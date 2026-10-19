@@ -14,8 +14,8 @@ BUILD="${BUILD_DIR:-$ROOT/build}"
 [ -x "$BUILD/bitmap_bench" ] || "$ROOT/scripts/build.sh"
 
 DATA="$ROOT/data/example"
-QUERIES="$ROOT/queries/example.txt"
-OUT="$ROOT/results/example"
+OUT="${EXAMPLE_OUTPUT_DIR:-$ROOT/results/example}"
+QUERIES="$OUT/queries.txt"
 NUM_BITMAPS=$(sed -n 's/^num_bitmaps=//p' "$DATA/metadata.txt")
 
 mkdir -p "$OUT"
@@ -24,7 +24,7 @@ mkdir -p "$OUT"
   --min-width=2 --max-width=4 --seed=43
 
 status=0
-for BACKEND in raw roaring wah; do
+for BACKEND in raw wah ewah roaring concise plwah val sbh bbc; do
   echo "==> $BACKEND"
   if ! "$BUILD/bitmap_bench" \
         --backend="$BACKEND" --dataset="$DATA" --queries="$QUERIES" \

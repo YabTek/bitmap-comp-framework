@@ -1,78 +1,47 @@
+#include "common/cli.hpp"
 #include "common/query.hpp"
-
-#include <cstdint>
-#include <cstring>
 #include <iostream>
+#include <numeric>
 #include <random>
-#include <string>
-#include <vector>
 
-namespace {
-
-bool starts_with(const std::string& s, const std::string& p) {
-    return s.size() >= p.size()
-           && std::memcmp(s.data(), p.data(), p.size()) == 0;
-}
-
-std::string arg_value(const std::string& a, const std::string& key) {
-    return a.substr(key.size());
-}
-
-void usage() {
-    std::cerr << "usage: generate_queries --out=PATH --num-bitmaps=N "
-              << "--num-queries=Q --min-width=A --max-width=B --seed=S\n";
-}
-
-} // namespace
-
-int main(int argc, char** argv) {
-    std::string out;
-    size_t num_bitmaps = 0, num_queries = 0;
-    size_t min_w = 2, max_w = 5;
-    uint64_t seed = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (starts_with(a, "--out=")) out = arg_value(a, "--out=");
-        else if (starts_with(a, "--num-bitmaps="))
-            num_bitmaps = std::stoull(arg_value(a, "--num-bitmaps="));
-        else if (starts_with(a, "--num-queries="))
-            num_queries = std::stoull(arg_value(a, "--num-queries="));
-        else if (starts_with(a, "--min-width="))
-            min_w = std::stoull(arg_value(a, "--min-width="));
-        else if (starts_with(a, "--max-width="))
-            max_w = std::stoull(arg_value(a, "--max-width="));
-        else if (starts_with(a, "--seed="))
-            seed = std::stoull(arg_value(a, "--seed="));
-        else { usage(); return 2; }
-    }
-    if (out.empty() || num_bitmaps == 0 || num_queries == 0
-        || min_w < 1 || max_w < min_w || max_w > num_bitmaps) {
-        usage();
-        return 2;
-    }
-
-    std::mt19937_64 rng(seed);
-    std::uniform_int_distribution<size_t> width_d(min_w, max_w);
-    std::bernoulli_distribution op_d(0.5);
-
-    std::vector<size_t> pool(num_bitmaps);
-    for (size_t j = 0; j < num_bitmaps; ++j) pool[j] = j;
-
-    std::vector<bench::Query> queries;
-    queries.reserve(num_queries);
-    for (size_t i = 0; i < num_queries; ++i) {
-        bench::Query q;
-        q.op = op_d(rng) ? bench::QueryOp::And : bench::QueryOp::Or;
-        size_t w = width_d(rng);
-        for (size_t k = 0; k < w; ++k) {
-            std::uniform_int_distribution<size_t> d(k, pool.size() - 1);
-            std::swap(pool[k], pool[d(rng)]);
-            q.ids.push_back(pool[k]);
+int main(int argc, char **argv) {
+    try {
+        bench::Arguments args(
+            argc, argv, {"out", "num-bitmaps", "num-queries", "min-width", "max-width", "seed"});
+        const auto out = args.get("out");
+        const uint64_t count = args.number("num-bitmaps", 0),
+                       queries = args.number("num-queries", 200);
+        const uint64_t low = args.number("min-width", 2), high = args.number("max-width", 5);
+        if (args.help) {
+            std::cout << "generate_queries --out=PATH --num-bitmaps=N [--num-queries=200] "
+                         "[--min-width=2] [--max-width=5] [--seed=43]\n";
+            return 0;
         }
-        queries.push_back(std::move(q));
+        if (out.empty() || !count || !queries || !low || low > high || high > count)
+            throw std::runtime_error("require out, positive bitmap/query counts and "
+                                     "1 <= min-width <= max-width <= num-bitmaps");
+        std::mt19937_64 rng(args.number("seed", 43));
+        std::uniform_int_distribution<size_t> width(static_cast<size_t>(low),
+                                                    static_cast<size_t>(high));
+        std::bernoulli_distribution op(0.5);
+        std::vector<size_t> pool(static_cast<size_t>(count));
+        std::iota(pool.begin(), pool.end(), 0);
+        std::vector<bench::Query> result;
+        for (uint64_t i = 0; i < queries; ++i) {
+            bench::Query q;
+            q.op = op(rng) ? bench::QueryOp::And : bench::QueryOp::Or;
+            const size_t n = width(rng);
+            for (size_t j = 0; j < n; ++j) {
+                std::uniform_int_distribution<size_t> pick(j, pool.size() - 1);
+                std::swap(pool[j], pool[pick(rng)]);
+                q.ids.push_back(pool[j]);
+            }
+            result.push_back(std::move(q));
+        }
+        bench::write_queries(out, result);
+        std::cout << "wrote " << queries << " queries to " << out << '\n';
+    } catch (const std::exception &e) {
+        std::cerr << "error: " << e.what() << '\n';
+        return 1;
     }
-    bench::write_queries(out, queries);
-    std::cout << "wrote " << num_queries << " queries to " << out << "\n";
-    return 0;
 }

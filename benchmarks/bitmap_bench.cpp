@@ -1,228 +1,248 @@
-// bitmap_bench -- the example benchmark driver.
-//
-// Loads one dataset, builds it with one backend, runs a query file against it
-// and writes one CSV row per (query, repetition). Everything the report needs
-// is in that CSV: build time, per-query time split by AND/OR, and the sizes the
-// compression ratio is computed from.
-//
-// What is timed and what is not:
-//   build_time_ms   - the whole build() call, i.e. converting the uncompressed
-//                     dataset into the backend's representation.
-//   query_time_ns   - one query_and()/query_or() call and nothing else. The
-//                     result stays compressed; counting its bits and decoding
-//                     it for verification happen outside the timer.
-// Verification (--verify=1) and warmup runs are never timed.
-#include "backends/bitmap_backend.hpp"
+// Dataset/query I/O, verification, output counting and statistics stay outside
+// query timings. Allocation of the materialized result is included; releasing
+// the returned result is not. Build samples use fresh backend instances.
+#include "backends/archive.hpp"
+#include "backends/factory.hpp"
 #include "backends/raw_backend.hpp"
-#include "backends/roaring_backend.hpp"
-#include "backends/wah_backend.hpp"
 #include "common/bitmap_io.hpp"
+#include "common/cli.hpp"
 #include "common/query.hpp"
 #include "common/timing.hpp"
-
-#include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <vector>
+#include <sstream>
+
+#ifndef BENCH_VERSION
+#define BENCH_VERSION "development"
+#endif
+#ifndef BENCH_COMPILER
+#define BENCH_COMPILER "unknown"
+#endif
+#ifndef BENCH_BUILD_TYPE
+#define BENCH_BUILD_TYPE "unknown"
+#endif
 
 namespace {
-
-bool starts_with(const std::string& s, const std::string& p) {
-    return s.size() >= p.size()
-           && std::memcmp(s.data(), p.data(), p.size()) == 0;
+std::string leaf(const std::string &s) {
+    auto path = std::filesystem::path(s).lexically_normal();
+    if (path.filename().empty())
+        path = path.parent_path();
+    return path.filename().string();
 }
-
-std::string arg_value(const std::string& a, const std::string& key) {
-    return a.substr(key.size());
+bench::QueryResultPtr run(const bench::BitmapBackend &b, const bench::Query &q) {
+    return q.op == bench::QueryOp::And ? b.query_and(q.ids) : b.query_or(q.ids);
 }
-
-// Register new backends here.
-std::unique_ptr<bench::BitmapBackend> make_backend(const std::string& name) {
-    if (name == "raw")     return std::make_unique<bench::RawBackend>();
-    if (name == "roaring") return std::make_unique<bench::RoaringBackend>();
-    if (name == "wah")     return std::make_unique<bench::WahBackend>();
-    throw std::runtime_error("unknown backend: " + name
-                             + " (available: raw, roaring, wah)");
-}
-
-// Last path component, tolerating the trailing slash a shell may append to a
-// directory argument (which would otherwise leave the CSV column empty).
-std::string leaf_name(const std::string& path) {
-    std::string s = path;
-    while (s.size() > 1 && (s.back() == '/' || s.back() == '\\')) s.pop_back();
-    return std::filesystem::path(s).filename().string();
-}
-
-// Metadata strings end up in a CSV field; keep the file trivially parseable.
-std::string csv_safe(const std::string& s) {
-    std::string out = s;
-    for (char& c : out)
-        if (c == ',' || c == '"' || c == '\n') c = '_';
-    return out;
-}
-
 void usage() {
-    std::cerr << "usage: bitmap_bench --backend=raw|roaring|wah --dataset=DIR "
-                 "--queries=PATH --out=CSV\n"
-                 "                    [--repetitions=N] [--warmup=N] "
-                 "[--verify=0|1]\n";
+    std::cout << "bitmap_bench --backend=NAME --dataset=DIR --queries=FILE --out=CSV\n"
+                 "  backends: raw wah ewah roaring concise plwah val sbh bbc\n"
+                 "  --repetitions=5 --warmup=1 --build-repetitions=3 --verify=1\n"
+                 "  --val-segment-bits=15|30|60|auto  --sbh-groups=128\n"
+                 "  --save=ARCHIVE --load=ARCHIVE (optional; load replaces "
+                 "construction)\n"
+                 "  --list-backends --version --help\n";
 }
-
+void stats_csv(std::ostream &out, const bench::RepresentationStats &s) {
+    out << s.literal_units << ',' << s.fill_units << ',' << s.exception_units << ','
+        << s.control_units << ',' << s.array_containers << ',' << s.bitmap_containers << ','
+        << s.run_containers;
+}
 } // namespace
-
-int main(int argc, char** argv) {
-    std::string backend_name, dataset_dir, queries_path, out_path;
-    bool verify = false;
-    int repetitions = 1;
-    int warmup = 0;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if (starts_with(a, "--backend="))      backend_name = arg_value(a, "--backend=");
-        else if (starts_with(a, "--dataset=")) dataset_dir  = arg_value(a, "--dataset=");
-        else if (starts_with(a, "--queries=")) queries_path = arg_value(a, "--queries=");
-        else if (starts_with(a, "--out="))     out_path     = arg_value(a, "--out=");
-        else if (starts_with(a, "--verify="))  verify = (arg_value(a, "--verify=") != "0");
-        else if (starts_with(a, "--repetitions=")) repetitions = std::stoi(arg_value(a, "--repetitions="));
-        else if (starts_with(a, "--warmup="))  warmup = std::stoi(arg_value(a, "--warmup="));
-        else { usage(); return 2; }
-    }
-    if (backend_name.empty() || dataset_dir.empty()
-        || queries_path.empty() || out_path.empty()) {
-        usage();
-        return 2;
-    }
-    if (repetitions < 1) repetitions = 1;
-    if (warmup < 0) warmup = 0;
-
-    bench::DatasetMetadata meta;
-    std::vector<std::vector<uint64_t>> bitmaps;
-    std::vector<bench::Query> queries;
+int main(int argc, char **argv) {
     try {
-        bitmaps = bench::load_dataset(dataset_dir, meta);
-        queries = bench::read_queries(queries_path);
-    } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n";
-        return 1;
-    }
-
-    // Every query index must address an existing bitmap, otherwise a backend
-    // would read out of bounds.
-    for (size_t qi = 0; qi < queries.size(); ++qi) {
-        if (queries[qi].ids.empty()) {
-            std::cerr << "error: query " << qi << " has no operands\n";
-            return 1;
+        bench::Arguments args(argc, argv,
+                              {"backend", "dataset", "queries", "out", "repetitions", "warmup",
+                               "build-repetitions", "verify", "val-segment-bits", "sbh-groups",
+                               "save", "load", "list-backends", "version"},
+                              {"list-backends", "version"});
+        if (args.help) {
+            usage();
+            return 0;
         }
-        for (size_t id : queries[qi].ids) {
-            if (id >= meta.num_bitmaps) {
-                std::cerr << "error: query " << qi << " refers to bitmap " << id
-                          << ", dataset has " << meta.num_bitmaps << "\n";
-                return 1;
+        if (args.has("version")) {
+            std::cout << "bitmap-comp-framework " << BENCH_VERSION << "; " << BENCH_COMPILER << "; "
+                      << BENCH_BUILD_TYPE << '\n';
+            return 0;
+        }
+        if (args.has("list-backends")) {
+            for (const auto &n : bench::backend_names())
+                std::cout << n << '\n';
+            return 0;
+        }
+        const auto name = args.get("backend"), dataset = args.get("dataset"),
+                   query_file = args.get("queries"), output = args.get("out");
+        if (name.empty() || dataset.empty() || query_file.empty() || output.empty()) {
+            usage();
+            return 2;
+        }
+        const uint64_t reps = args.number("repetitions", 5), warmup = args.number("warmup", 1),
+                       build_reps = args.number("build-repetitions", 3);
+        if (!reps || !build_reps)
+            throw std::runtime_error("repetitions and build-repetitions must be positive");
+        const bool verify = args.boolean("verify", true);
+        bench::CodecOptions options;
+        const auto val = args.get("val-segment-bits", "15");
+        const auto width = val == "auto" ? 0 : bench::parse_unsigned(val, "VAL segment size");
+        if (width != 0 && width != 15 && width != 30 && width != 60)
+            throw std::runtime_error("VAL segment size must be 15, 30, 60 or auto");
+        options.val_segment_bits = static_cast<unsigned>(width);
+        const auto sbh = args.number("sbh-groups", 128);
+        if (!sbh || sbh > 4095)
+            throw std::runtime_error("sbh-groups must be in 1..4095");
+        options.sbh_groups = static_cast<unsigned>(sbh);
+
+        bench::DatasetMetadata meta;
+        const auto data = bench::load_dataset(dataset, meta);
+        const auto queries = bench::read_queries(query_file);
+        for (const auto &q : queries)
+            bench::validate_ids(q.ids, data.size());
+        bench::RawBackend reference;
+        reference.build(data, meta.num_bits);
+        std::unique_ptr<bench::BitmapBackend> backend;
+        std::vector<double> build_samples;
+        double build_ms = 0, load_ms = 0;
+        if (args.has("load")) {
+            const auto bytes = bench::read_bytes(args.get("load"));
+            const auto archive = bench::unpack_archive(bytes, bench::format_id(name));
+            if (archive.num_bits != meta.num_bits || archive.payloads.size() != data.size())
+                throw std::runtime_error("loaded archive does not match dataset dimensions");
+            backend = bench::make_backend(name, options);
+            bench::Timer timer;
+            backend->deserialize(bytes);
+            load_ms = timer.elapsed_ms();
+        } else {
+            for (uint64_t r = 0; r < build_reps; ++r) {
+                auto fresh = bench::make_backend(name, options);
+                bench::Timer timer;
+                fresh->build(data, meta.num_bits);
+                build_samples.push_back(timer.elapsed_ms());
+                backend = std::move(fresh);
             }
+            auto sorted = build_samples;
+            std::sort(sorted.begin(), sorted.end());
+            const size_t m = sorted.size() / 2;
+            build_ms = sorted.size() % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
         }
-    }
+        const auto bytes = backend->serialized_bytes(), payload = backend->payload_bytes();
+        const auto raw_bytes = reference.serialized_bytes(),
+                   raw_payload = reference.payload_bytes();
+        const auto stats = backend->statistics();
+        const double ratio = bytes ? double(raw_bytes) / double(bytes) : 0;
+        if (args.has("save"))
+            bench::write_bytes(args.get("save"), backend->serialize());
 
-    std::unique_ptr<bench::BitmapBackend> backend;
-    try {
-        backend = make_backend(backend_name);
-    } catch (const std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n";
-        return 2;
-    }
-
-    bench::Timer build_timer;
-    backend->build(bitmaps, meta.num_bits);
-    const double build_ms = build_timer.elapsed_ms();
-
-    // The uncompressed dataset is the reference point for the compression
-    // ratio, and (under --verify=1) the reference answer for every query.
-    bench::RawBackend reference;
-    reference.build(bitmaps, meta.num_bits);
-    const size_t raw_bytes = reference.serialized_bytes();
-    const size_t compressed_bytes = backend->serialized_bytes();
-    const double ratio = compressed_bytes
-                             ? static_cast<double>(raw_bytes) / static_cast<double>(compressed_bytes)
-                             : 0.0;
-
-    const auto out_dir = std::filesystem::path(out_path).parent_path();
-    if (!out_dir.empty()) std::filesystem::create_directories(out_dir);
-    std::ofstream csv(out_path);
-    if (!csv) {
-        std::cerr << "error: cannot write " << out_path << "\n";
-        return 1;
-    }
-    csv << "backend,dataset,kind,params,num_bits,num_bitmaps,density,seed,"
-           "query_file,query_index,query_type,query_width,repetition,"
-           "build_time_ms,query_time_ns,result_cardinality,"
-           "raw_bytes,compressed_bytes,compression_ratio\n";
-
-    const std::string dataset_name = leaf_name(dataset_dir);
-    const std::string queries_name = leaf_name(queries_path);
-
-    auto run_query = [&](const bench::BitmapBackend& b, const bench::Query& q) {
-        return (q.op == bench::QueryOp::And) ? b.query_and(q.ids)
-                                             : b.query_or(q.ids);
-    };
-
-    size_t mismatches = 0;
-    for (size_t qi = 0; qi < queries.size(); ++qi) {
-        const auto& q = queries[qi];
-
+        std::unique_ptr<bench::BitmapBackend> restored;
         if (verify) {
-            const auto got      = run_query(*backend, q)->to_words();
-            const auto expected = run_query(reference, q)->to_words();
-            if (got != expected) {
-                ++mismatches;
-                std::cerr << "verify: mismatch at query " << qi << "\n";
+            const auto archive = backend->serialize();
+            if (archive.size() != bytes)
+                throw std::runtime_error("saved size disagrees with actual archive");
+            restored = bench::make_backend(name, options);
+            restored->deserialize(archive);
+            for (size_t i = 0; i < data.size(); ++i) {
+                for (const auto *candidate : {backend.get(), restored.get()}) {
+                    const auto value = candidate->query_or({i});
+                    if (value->to_words() != data[i] ||
+                        value->cardinality() != bench::cardinality(data[i]))
+                        throw std::runtime_error(
+                            "bitmap failed build/save/load verification at index " +
+                            std::to_string(i));
+                }
             }
         }
-
-        for (int w = 0; w < warmup; ++w) (void)run_query(*backend, q);
-
-        for (int r = 0; r < repetitions; ++r) {
-            bench::Timer query_timer;
-            bench::QueryResultPtr result = run_query(*backend, q);
-            const int64_t query_ns = query_timer.elapsed_ns();
-
-            csv << backend->name()          << ","
-                << csv_safe(dataset_name)   << ","
-                << csv_safe(meta.kind)      << ","
-                << csv_safe(meta.params)    << ","
-                << meta.num_bits            << ","
-                << meta.num_bitmaps         << ","
-                << meta.density             << ","
-                << meta.seed                << ","
-                << csv_safe(queries_name)   << ","
-                << qi                       << ","
-                << bench::query_op_str(q.op) << ","
-                << q.ids.size()             << ","
-                << r                        << ","
-                << build_ms                 << ","
-                << query_ns                 << ","
-                << result->cardinality()    << ","
-                << raw_bytes                << ","
-                << compressed_bytes         << ","
-                << ratio                    << "\n";
+        const auto parent = std::filesystem::path(output).parent_path();
+        if (!parent.empty())
+            std::filesystem::create_directories(parent);
+        std::ofstream csv(output);
+        if (!csv)
+            throw std::runtime_error("cannot write " + output);
+        csv << std::setprecision(17);
+        csv << "backend,dataset,kind,params,num_bits,num_bitmaps,density,seed,"
+               "query_file,query_index,query_type,query_width,repetition,"
+               "build_time_ms,query_time_ns,result_cardinality,raw_bytes,"
+               "compressed_bytes,compression_ratio,"
+               "raw_payload_bytes,payload_bytes,result_payload_bytes,query_ids,"
+               "input_cardinalities,intersection_cardinality,"
+               "build_repetitions,load_time_ms,input_mode,val_segment_bits,sbh_"
+               "groups,verified,"
+               "literal_units,fill_units,exception_units,control_units,array_"
+               "containers,bitmap_containers,run_containers\n";
+        const std::string dataset_name = leaf(dataset), query_name = leaf(query_file);
+        // Archives carry their own selectors and region sizes. Do not label
+        // loaded data with unused construction options from this invocation.
+        const std::string val_label = name == "val" ? (args.has("load") ? "stored" : val) : "";
+        const std::string sbh_label =
+            name == "sbh" ? (args.has("load") ? "stored" : std::to_string(sbh)) : "";
+        for (size_t qi = 0; qi < queries.size(); ++qi) {
+            const auto &q = queries[qi];
+            const auto expected = run(reference, q)->to_words();
+            const auto intersection = reference.query_and(q.ids)->cardinality();
+            std::ostringstream ids, cards;
+            for (size_t j = 0; j < q.ids.size(); ++j) {
+                if (j) {
+                    ids << ';';
+                    cards << ';';
+                }
+                ids << q.ids[j];
+                cards << bench::cardinality(data[q.ids[j]]);
+            }
+            if (verify && run(*restored, q)->to_words() != expected)
+                throw std::runtime_error("loaded archive query mismatch at query " +
+                                         std::to_string(qi));
+            for (uint64_t w = 0; w < warmup; ++w)
+                (void)run(*backend, q);
+            for (uint64_t r = 0; r < reps; ++r) {
+                bench::Timer timer;
+                const auto result = run(*backend, q);
+                const int64_t ns = timer.elapsed_ns();
+                const auto card = result->cardinality();
+                if (verify &&
+                    (result->to_words() != expected || card != bench::cardinality(expected)))
+                    throw std::runtime_error("query verification mismatch at query " +
+                                             std::to_string(qi));
+                csv << backend->name() << ',' << bench::csv_field(dataset_name) << ','
+                    << bench::csv_field(meta.kind) << ',' << bench::csv_field(meta.params) << ','
+                    << meta.num_bits << ',' << data.size() << ',' << meta.density << ',';
+                if (meta.seed_present)
+                    csv << meta.seed;
+                csv << ',' << bench::csv_field(query_name) << ',' << qi << ','
+                    << bench::query_op_str(q.op) << ',' << q.ids.size() << ',' << r << ','
+                    << build_ms << ',' << ns << ',' << card << ',' << raw_bytes << ',' << bytes
+                    << ',' << ratio << ',' << raw_payload << ',' << payload << ','
+                    << result->payload_bytes() << ',' << ids.str() << ',' << cards.str() << ','
+                    << intersection << ',' << (args.has("load") ? 0 : build_reps) << ',' << load_ms
+                    << ',' << (args.has("load") ? "load" : "build") << ',' << val_label << ','
+                    << sbh_label << ',' << (verify ? 1 : 0) << ',';
+                stats_csv(csv, stats);
+                csv << '\n';
+            }
         }
+        csv.close();
+        if (!csv)
+            throw std::runtime_error("failed writing results: " + output);
+        std::ofstream run_info(output + ".run.txt");
+        run_info << "framework=" << BENCH_VERSION << "\ncompiler=" << BENCH_COMPILER
+                 << "\nbuild_type=" << BENCH_BUILD_TYPE << "\nbackend=" << backend->name()
+                 << "\nverified=" << verify << "\nwarmup=" << warmup << "\nrepetitions=" << reps
+                 << "\ninput_mode=" << (args.has("load") ? "load" : "build")
+                 << "\nbuild_samples_ms=" << std::setprecision(17);
+        for (auto ms : build_samples)
+            run_info << ms << ';';
+        run_info << "\nval_segment_bits=" << val_label << "\nsbh_groups=" << sbh_label
+                 << "\ndataset=" << std::filesystem::absolute(dataset).string()
+                 << "\nqueries=" << std::filesystem::absolute(query_file).string()
+                 << "\nallocation=materialized result allocation included; "
+                    "returned-result destruction excluded\n";
+        run_info.close();
+        if (!run_info)
+            throw std::runtime_error("failed writing run metadata: " + output + ".run.txt");
+        std::cout << "backend=" << backend->name() << " queries=" << queries.size()
+                  << " repetitions=" << reps << " saved_bytes=" << bytes
+                  << " payload_bytes=" << payload << " -> " << output << '\n';
+        if (verify)
+            std::cout << "verify: 0 mismatches; input, save/load and query checks passed\n";
+    } catch (const std::exception &e) {
+        std::cerr << "error: " << e.what() << '\n';
+        return 1;
     }
-
-    std::cout << "backend=" << backend->name()
-              << " dataset=" << dataset_name
-              << " queries=" << queries.size()
-              << " reps=" << repetitions
-              << " build=" << build_ms << "ms"
-              << " size=" << compressed_bytes << "B"
-              << " ratio=" << ratio
-              << " -> " << out_path << "\n";
-    if (verify) {
-        std::cout << "verify: " << mismatches << " mismatches out of "
-                  << queries.size() << " queries\n";
-        if (mismatches > 0) return 1;
-    }
-    return 0;
 }

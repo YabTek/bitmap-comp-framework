@@ -19,16 +19,17 @@ if ! command -v cmake >/dev/null 2>&1; then
   exit 1
 fi
 
-CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release)
+CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBENCH_NATIVE=OFF -DBENCH_SANITIZERS=OFF -DBUILD_TESTING=ON)
 if [ "${BENCH_NATIVE:-0}" != "0" ]; then
   CMAKE_ARGS+=(-DBENCH_NATIVE=ON)
 fi
 
 cmake -S "$ROOT" -B "$BUILD" "${CMAKE_ARGS[@]}"
-cmake --build "$BUILD" --parallel
+cmake --build "$BUILD" --config Release --parallel
+ctest --test-dir "$BUILD" -C Release --output-on-failure
 
 echo
 echo "built into $BUILD:"
-for exe in bitmap_bench generate_queries generate_dataset; do
+for exe in bitmap_bench bitmap_inspect generate_queries generate_dataset; do
   if [ -x "$BUILD/$exe" ]; then echo "  $exe"; fi
 done

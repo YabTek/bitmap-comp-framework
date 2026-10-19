@@ -1,4 +1,4 @@
-build/
+build*/
 queries/
 results/
 data/*
@@ -8,3 +8,5 @@ data/*
 *.log
 *.o
 *.out
+
+*.bmcf

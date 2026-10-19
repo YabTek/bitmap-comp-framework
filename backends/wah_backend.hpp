@@ -14,21 +14,25 @@
 // streams: at each step the two readers agree on how many groups they can
 // consume at once (min of the two remaining run lengths), so a query over long
 // runs touches few words. That is the whole point of the representation, and
-// the reason its query time depends on run structure rather than on cardinality.
+// the reason its query time depends on run structure rather than on
+// cardinality.
 #include "backends/bitmap_backend.hpp"
 
 namespace bench {
 
 class WahBackend : public BitmapBackend {
-public:
-    void build(const std::vector<std::vector<uint64_t>>& bitmaps,
-               uint64_t num_bits) override;
-    QueryResultPtr query_and(const std::vector<size_t>& ids) const override;
-    QueryResultPtr query_or(const std::vector<size_t>& ids) const override;
+  public:
+    void build(const std::vector<std::vector<uint64_t>> &bitmaps, uint64_t num_bits) override;
+    QueryResultPtr query_and(const std::vector<size_t> &ids) const override;
+    QueryResultPtr query_or(const std::vector<size_t> &ids) const override;
     size_t serialized_bytes() const override;
-    const char* name() const override { return "wah"; }
+    size_t payload_bytes() const override;
+    RepresentationStats statistics() const override;
+    Bytes serialize() const override;
+    void deserialize(const Bytes &bytes) override;
+    const char *name() const override { return "wah"; }
 
-private:
+  private:
     // One compressed code-word stream per bitmap.
     std::vector<std::vector<uint64_t>> compressed_;
     uint64_t num_bits_ = 0;

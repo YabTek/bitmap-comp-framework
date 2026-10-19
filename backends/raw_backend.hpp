@@ -10,15 +10,17 @@
 namespace bench {
 
 class RawBackend : public BitmapBackend {
-public:
-    void build(const std::vector<std::vector<uint64_t>>& bitmaps,
-               uint64_t num_bits) override;
-    QueryResultPtr query_and(const std::vector<size_t>& ids) const override;
-    QueryResultPtr query_or(const std::vector<size_t>& ids) const override;
+  public:
+    void build(const std::vector<std::vector<uint64_t>> &bitmaps, uint64_t num_bits) override;
+    QueryResultPtr query_and(const std::vector<size_t> &ids) const override;
+    QueryResultPtr query_or(const std::vector<size_t> &ids) const override;
     size_t serialized_bytes() const override;
-    const char* name() const override { return "raw"; }
+    size_t payload_bytes() const override;
+    Bytes serialize() const override;
+    void deserialize(const Bytes &bytes) override;
+    const char *name() const override { return "raw"; }
 
-private:
+  private:
     std::vector<std::vector<uint64_t>> bitmaps_;
     uint64_t num_bits_ = 0;
     size_t num_words_ = 0;

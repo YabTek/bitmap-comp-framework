@@ -1,232 +1,232 @@
-# bitmap-comp-framework — starting framework
+# Bitmap compression framework
 
-Benchmark harness for the laboratory project **“Benchmarking Bitmap
-Compression Methods”**. It measures how the characteristics of bitmap data —
-density, clustering, run length — affect the compression ratio and the query
-performance of different bitmap representations.
+A C++17 starter framework for **Benchmarking Bitmap Compression Methods**.
+It supplies nine bitmap representations, AND/OR queries, exact saved sizes,
+correctness checks, and CSV measurements. No external libraries are required.
 
-The infrastructure is here already: three bitmap backends, a query generator, a
-benchmark driver that writes CSV, and a CMake build with no external
-dependencies. **What is missing is the dataset generator — that is Task 1.**
+**Your work:** implement the dataset generator, design controlled experiments,
+automate the runs, and explain the results. You do not have to implement the
+compression formats. Compare Raw, WAH, EWAH, Roaring and your group's additional
+format: PLWAH, CONCISE, VAL-WAH, SBH or BBC. The
+[assignment handout](https://annbolotina.github.io/teaching/ATDA/handouts/assignment_1_formats.pdf)
+provides explanations and research questions; the course slides specify the
+submission requirements.
 
----
+## Build and check
 
-## What you get and what you write
+Requirements: CMake 3.20+, a C++17 compiler, and a 64-bit environment. Tested with
+Apple Clang 16 and LLVM Clang 21 on macOS; the code also targets GCC and MSVC,
+but those platforms have not been tested for this release.
 
-| | |
-|---|---|
-| given | `raw`, `roaring`, `wah` backends; `bitmap_bench`; `generate_queries`; CMake build; one small example dataset |
-| you write | `tools/generate_dataset.cpp` (Task 1), the experiment sweep (Task 2), the plots and the report (Task 3) |
-
-You are not expected to modify the backends. You may, if a measurement you want
-is not exposed — but say so in the report if you do.
-
-## Requirements
-
-A C++17 compiler (GCC ≥ 9, Clang ≥ 10, MSVC 2019) and CMake ≥ 3.16. Nothing
-else: every representation is implemented inside this repository.
-
-## Build
-
-```
-scripts/build.sh          # Release build into build/
-```
-
-or directly:
-
-```
+```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake --build build --config Release --parallel
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-Always measure a **Release** build. A Debug build is 10–100× slower and does not
-slow all backends down by the same factor, so Debug numbers say nothing about
-the representations.
+On macOS/Linux, `scripts/build.sh` performs the build and tests. For a
+multi-configuration generator such as Visual Studio, executables are under
+`build/Release/`; use that path instead of `build/` in the commands below.
+Always use a Release build for measurements.
 
-## Check that it works
-
-```
+```sh
 scripts/run_example.sh
 ```
 
-Generates 200 queries, runs all three backends over `data/example` with
-`--verify=1`, writes one CSV per backend into `results/example/`. Expect
-`0 mismatches` from every backend.
+This runs all nine backends on the committed example dataset with verification.
+Each should report `0 mismatches`. Results go to `results/example/`.
+The small example checks the pipeline; it is not a substitute for your own
+experiment datasets. It intentionally does not answer the research questions.
 
-`data/example` is a single small uniform dataset. It exists so the pipeline can
-be checked before Task 1 is finished, and as a worked example of the on-disk
-format. It answers none of the project's questions — do not report numbers from
-it.
+## Available representations
 
-## Repository layout
+| `--backend` | Configuration supplied | How AND/OR are computed |
+|---|---|---|
+| `raw` | Packed 64-bit words | Word loops |
+| `wah` | 64-bit codewords, 63-bit logical groups | Compressed fill/literal merge |
+| `ewah` | 64-bit literals and separate markers | Compressed marker/literal merge |
+| `roaring` | Array, bitmap and run containers | Container operations |
+| `plwah` | 32-bit, one exception, fixed 25-bit counter | Compressed merge with exception decoding |
+| `concise` | 32-bit, exception in first group | Compressed merge with exception decoding |
+| `val` | VAL-WAH, packed 64-bit words; 15/30/60-bit segments | Aligned compressed segment merge |
+| `sbh` | 7-bit groups, bounded super-buckets | Expand one region per operand, combine, re-encode |
+| `bbc` | Patent layout, all five control families | Compressed fill/tail/exception merge |
 
-```
-backends/     the three bitmap representations behind a common interface
-common/       dataset I/O, query file I/O, timing, bit helpers
-tools/        generate_queries (generate_dataset is yours to write)
-benchmarks/   bitmap_bench — the example benchmark driver
-scripts/      build / example run / clean
-data/example  small committed dataset, format reference
-```
+These are portable scalar implementations for this course, not bindings to
+production libraries. The format choices and operation paths are documented in
+[docs/formats.md](docs/formats.md). Timings describe **these implementations**;
+they do not establish a universal ranking of published formats or libraries.
+Construction includes encoding and the configured optimization policy.
 
----
+## Your dataset generator
 
-## Backends
+Write `tools/generate_dataset.cpp` and add its target at the marked place in
+`CMakeLists.txt`. Helpers in `common/bitmap_io.hpp` write this directory format:
 
-All three implement `bench::BitmapBackend` (`backends/bitmap_backend.hpp`).
-`build()` receives the whole dataset uncompressed and converts it; `query_and()`
-and `query_or()` then operate **in the backend's own representation** and return
-a still-compressed result. Decoding that result back to plain words happens
-outside the timed region, so `query_time_ns` measures the operation and not the
-decompression.
-
-**`raw`** — one packed `uint64_t` array per bitmap, no compression. AND/OR are
-word loops over the full length. It is the baseline for the compression ratio
-and the correctness oracle: under `--verify=1` every other backend's answer is
-compared against it bit for bit.
-
-**`roaring`** — Roaring bitmaps. The universe is split into chunks of 2¹⁶ bits;
-each non-empty chunk is stored in whichever of three encodings is smallest —
-sorted 16-bit *array* (2 bytes per bit set), flat *bitset* (8192 bytes), or
-*run* list of intervals (4 bytes per run). AND/OR are performed chunk by chunk,
-and a chunk absent from one operand can be skipped entirely.
-
-**`wah`** — Word-Aligned Hybrid run-length compression. Bits are cut into groups
-of 63; each 64-bit code word is either one group verbatim (*literal*) or a count
-of consecutive all-zero / all-one groups (*fill*). AND/OR walk the two
-compressed streams in one pass, consuming whole fills at a time.
-
-A note you may find useful for the report: `roaring` and `wah` are compact
-implementations written for this project, not the reference libraries
-(CRoaring, EWAHBoolArray). They follow the published designs and the same
-serialized layouts, but they are portable scalar C++ with no SIMD, and they take
-two documented shortcuts:
-
-* Roaring re-picks the smallest encoding after *every* operation, where CRoaring
-  converts to run encoding only on an explicit `runOptimize()` call;
-* an operation between a run container and an array/bitset container expands
-  both sides to a bitset instead of using a dedicated algorithm (`container_and`
-  / `container_or` in `backends/roaring_bitmap.cpp`).
-
-Absolute timings are therefore slower than a production library's. The *shape*
-of the curves — which data characteristic helps or hurts which representation —
-is what this framework is built to show.
-
-## Dataset format (what Task 1 must produce)
-
-A dataset is a directory:
-
-```
+```text
 metadata.txt
 bitmap_000.bin
 bitmap_001.bin
 ...
 ```
 
-`metadata.txt` is `key=value`, one per line:
+Example metadata:
 
-| key | required | meaning |
-|---|---|---|
-| `num_bits` | yes | length of every bitmap, in bits |
-| `num_bitmaps` | yes | how many `bitmap_NNN.bin` files follow |
-| `word_bits` | yes | must be `64` |
-| `format` | yes | must be `raw_uint64_le` |
-| `kind` | no | name of the distribution: `uniform`, `sparse`, `clustered`, … |
-| `params` | no | free-form description of the generator parameters |
-| `density` | no | fraction of set bits |
-| `seed` | no | RNG seed |
-
-`kind`, `params`, `density` and `seed` are copied into every CSV row, which is
-how you group runs during analysis — fill them in. Unknown keys are ignored, so
-you can record more if you want.
-
-Each `bitmap_NNN.bin` holds `ceil(num_bits / 64)` little-endian `uint64_t` words;
-bit *b* lives in word *b*/64 at position *b*%64. **Bits past `num_bits` in the
-last word must be zero** — otherwise two representations of the same set can
-disagree and `--verify=1` will report mismatches that are your generator's fault.
-
-`common/bitmap_io.hpp` already provides `write_metadata()`, `write_bitmap()` and
-`bitmap_filename()`, so a generator only has to fill in the words. Add your
-target to `CMakeLists.txt` (there is a comment marking the spot).
-
-Parameters must come from the command line — the existing tools show the
-convention (`--out=`, `--num-bits=`, …) but nothing forces you to follow it.
-
-## Query format
-
-One query per line: operation, number of operands, then bitmap indices.
-
-```
-AND 3 0 1 2
-OR 2 3 4
+```text
+num_bits=100000
+num_bitmaps=6
+word_bits=64
+format=raw_uint64_le
+kind=uniform
+params=p=0.01
+density=0.01
+seed=1
 ```
 
-Generate one with:
+The first four fields are required. `num_bits` is in 0..2^32 and
+`num_bitmaps` must be positive. Optional `kind`, `params`, `density`, and `seed`
+are copied to the results. Missing density is written as −1 in CSV, and a
+missing seed is blank. Whitespace around fields is ignored. `density`, if
+provided, must be finite and in [0,1]; omit it if it is not a meaningful summary.
+Unknown metadata keys may record additional generator parameters, but they are
+not copied into CSV automatically. Duplicate keys are rejected.
 
-```
-build/generate_queries --out=queries/q.txt --num-bitmaps=16 \
-    --num-queries=200 --min-width=2 --max-width=5 --seed=43
-```
+Each bitmap contains `ceil(num_bits/64)` **little-endian** 64-bit words.
+Position `b` is bit `b % 64` of word `b / 64`. Bits beyond `num_bits` in the last
+word must be zero. File lengths and padding are checked: the reader does not
+silently fix a faulty generator. `num_bits=0` uses a zero-byte bitmap file.
 
-Query width (the number of operands) is a parameter worth varying: it changes
-how much of the cost is per-operation overhead versus per-bit work. Watch
-`result_cardinality` when you do — on sparse data a wide AND is empty, and the
-time it takes says more about how fast each representation discovers that than
-about intersection itself.
+Use `write_metadata()`, `write_bitmap()`, `bitmap_filename()` and the helpers
+in `common/bits.hpp`. `write_metadata()` creates the dataset directory.
+Expose parameters and a seed through the command line; record enough to
+reproduce the exact data. There is deliberately no supplied generator for the
+experimental distributions, nor a completed experiment sweep or plotting code.
 
-## Running the benchmark
+## Queries and benchmark
 
-```
-build/bitmap_bench --backend=roaring --dataset=data/mydata \
-    --queries=queries/q.txt --out=results/roaring.csv \
-    --repetitions=5 --warmup=1 --verify=0
-```
+A query file contains one operation, operand count, and list of zero-based
+bitmap IDs per line. Empty lines and lines starting with `#` are ignored.
 
-| flag | meaning |
-|---|---|
-| `--backend=` | `raw`, `roaring` or `wah` |
-| `--repetitions=N` | timed runs per query; every run is one CSV row |
-| `--warmup=N` | untimed runs before the timed ones (cache warming) |
-| `--verify=1` | check every answer against `raw`; exits non-zero on mismatch |
-
-Run with `--verify=1` once per dataset — a wrong result is not a fast result —
-then measure with `--verify=0`.
-
-## Output CSV
-
-One row per (query, repetition):
-
-```
-backend, dataset, kind, params, num_bits, num_bitmaps, density, seed,
-query_file, query_index, query_type, query_width, repetition,
-build_time_ms, query_time_ns, result_cardinality,
-raw_bytes, compressed_bytes, compression_ratio
+```text
+AND 2 0 1
+OR 3 1 2 3
 ```
 
-* `build_time_ms` — the whole `build()` call: converting the uncompressed
-  dataset into this representation. Constant per run, repeated on every row.
-* `query_time_ns` — one `query_and()` / `query_or()` call. Split AND from OR
-  with `query_type`; they behave differently and averaging them together hides
-  the effect.
-* `compressed_bytes` — the size of the **whole dataset** in this
-  representation, serialized: payload only, no allocator slack and no
-  `std::vector` capacity overshoot. `raw_bytes` is `num_bitmaps *
-  ceil(num_bits/64) * 8`.
-* `compression_ratio` — `raw_bytes / compressed_bytes`. Above 1 means the
-  representation is smaller than the uncompressed bitmap; **below 1 means it is
-  larger**, which does happen and is worth explaining.
-* `result_cardinality` — set bits in the answer; also a cheap sanity check that
-  a query did what you expected.
+Unary queries and repeated IDs are valid. A query must contain at least one
+operand; all IDs must exist. Random query generation uses distinct IDs within
+each query:
 
-## Measurement notes
+```sh
+build/generate_queries --out=queries/example.txt --num-bitmaps=6 \
+    --num-queries=200 --min-width=2 --max-width=4 --seed=43
 
-* Report the **median** over repetitions, not the mean — one descheduled run
-  skews a mean badly.
-* Compare only numbers produced by the same binary on the same machine.
-  `BENCH_NATIVE=1` (i.e. `-march=native`) makes binaries machine-specific.
-* Close other work while measuring; a laptop on battery will throttle and the
-  effect is larger than most of the differences you are looking for.
-* Keep the seeds. Every number in the report should be reproducible from the
-  generator parameters recorded in `metadata.txt`.
-* Generated `data/`, `queries/`, `results/` and `build/` are not meant to be
-  committed — the seeds and the scripts are enough to reproduce them.
+build/bitmap_bench --backend=ewah --dataset=data/example \
+    --queries=queries/example.txt --out=results/ewah.csv \
+    --repetitions=7 --warmup=2 --build-repetitions=3 --verify=1
+```
+
+`--verify=1` is the default. It checks construction, save/load, and every timed
+query against Raw **outside the timed interval**, including decoded positions
+and cardinality. Any failure exits nonzero. Only use output from successful
+runs. `--verify=0` disables those comparisons; repeat verification for each new
+dataset or code change before using unverified measurements.
+
+Use the *same query file and dataset* across representations. Record the exact
+input cardinalities and overlap rather than inferring them from global density.
+Random query generation chooses operands; it does not control their overlap.
+
+```sh
+# VAL: force a legal segment length, or select the smallest saved payload
+build/bitmap_bench --backend=val --val-segment-bits=auto \
+    --dataset=data/example --queries=queries/example.txt --out=results/val.csv
+
+# SBH: number of 7-bit groups per region, 1..4095 (default 128)
+build/bitmap_bench --backend=sbh --sbh-groups=128 \
+    --dataset=data/example --queries=queries/example.txt --out=results/sbh.csv
+```
+
+VAL defaults to 15 bits. `auto` tries all three widths during construction;
+this is a size selector, not the paper's λ-based selector. Its cost is included
+in build time. SBH's default region covers 896 original bits. Different settings
+are different experiments: record them.
+
+## Save, load, inspect
+
+```sh
+build/bitmap_bench --backend=roaring --dataset=data/example \
+    --queries=queries/example.txt --out=results/build.csv --save=results/data.bmcf
+
+build/bitmap_bench --backend=roaring --dataset=data/example \
+    --queries=queries/example.txt --out=results/load.csv --load=results/data.bmcf
+
+build/bitmap_inspect --backend=plwah --dataset=data/example --bitmap=0 \
+    --max-bytes=64 --max-positions=16
+```
+
+Loading uses selectors stored in the archive; construction flags do not
+re-encode loaded bitmaps. The original dataset is still required to check
+identity and serve as the reference. `--verify=0` checks dimensions but does not
+check that an archive represents the same sets as that dataset.
+
+`bitmap_inspect` prints logical positions, byte counts, representation counters,
+and a bounded hex dump of one bitmap's actual payload. The dump is in **file
+byte order**, so multibyte codewords appear little-endian. It is useful when
+checking an encoding calculation. `--help` lists each tool's options.
+
+## Results and interpretation
+
+Every query repetition is one CSV row. A companion `.csv.run.txt` records the
+compiler, build configuration, warmup, construction samples, and allocation
+policy. Record your machine and OS separately.
+
+* `query_time_ns`: the AND/OR call, including allocation and encoding of the
+  materialized result. Input reading, verification, cardinality, and final
+  result destruction are outside the timer.
+* `build_time_ms`: median of `--build-repetitions` constructions on fresh
+  backends. Repeated in every row, so do not treat those rows as independent
+  build measurements. The companion file preserves the individual samples.
+* `compressed_bytes`: exact size of the **saved whole dataset**, including the
+  shared 32-byte archive header, an 8-byte length per bitmap, and all native
+  payloads. `raw_bytes` uses the same framing.
+* `compression_ratio = raw_bytes / compressed_bytes`: greater than 1 means
+  smaller than saved Raw; below 1 means larger.
+* `payload_bytes` and `raw_payload_bytes`: sizes excluding the shared archive
+  framing. They still include format-specific headers, selectors and padding.
+  `result_payload_bytes` describes the returned query result.
+* `query_ids`, `input_cardinalities`, `intersection_cardinality`: actual
+  operands and their shared set positions. Lists use semicolons within a CSV
+  field. For binary queries the last field is `t = |A ∩ B|`.
+* `input_mode`, `load_time_ms`: distinguish construction from archive loading.
+  Loaded runs have zero build time and zero build repetitions; zero means
+  "not measured here", not free construction.
+* `literal_units`, `fill_units`, `exception_units`, `control_units`, and
+  container counts describe the **input dataset**. Their units differ across
+  formats; see [docs/measurements.md](docs/measurements.md).
+
+Compare medians and variation over repeated runs; keep AND and OR separate.
+Warmup is a number of untimed calls before measuring **each query**, not a
+Java-specific framework. It does not guarantee that all data fits in cache.
+For reproducibility, vary backend order, keep seeds and scripts, and report
+settings and optimization policy. More detail is in
+[docs/measurements.md](docs/measurements.md).
+
+## Development checks
+
+```sh
+# Clang/GCC: optional address and undefined-behavior checks
+cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DBENCH_SANITIZERS=ON
+cmake --build build-sanitize --parallel
+ctest --test-dir build-sanitize --output-on-failure
+```
+
+Tests cover all nine representations, randomized AND/OR comparisons, partial
+groups, container/region/counter boundaries, known encoded examples, malformed
+archives, round trips, and the command-line pipeline. The repository contains
+no third-party implementation code. References and the exact implementation
+scope are listed in [docs/formats.md](docs/formats.md). The release validation
+record is in [docs/validation.md](docs/validation.md).
+
+`scripts/clean.sh` removes only the default `build/` directory. Add `--outputs`
+to also remove `queries/` and `results/`. It never deletes dataset directories.
+`BUILD_DIR` overrides the build location for the build and example scripts;
+`EXAMPLE_OUTPUT_DIR` overrides the example output directory.
