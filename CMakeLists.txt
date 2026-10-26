@@ -91,3 +91,6 @@ endif()
 #
 # bench_common gives you write_metadata() / write_bitmap() from
 # common/bitmap_io.hpp, which produce exactly the format the benchmark reads.
+
+add_executable(generate_dataset tools/generate_dataset.cpp)
+target_link_libraries(generate_dataset PRIVATE bench_common)
